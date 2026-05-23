@@ -1,0 +1,20 @@
+{
+  "name": "circuit-json-to-simple-route-json",
+  "module": "lib/index.ts",
+  "type": "module",
+  "private": true,
+  "files": ["lib"],
+  "scripts": {
+    "format": "biome format --write .",
+    "format:check": "biome check .",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.15",
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}
