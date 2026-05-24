@@ -1,0 +1,520 @@
+import type { CircuitJsonUtilObjects } from "@tscircuit/circuit-json-util"
+import { su } from "@tscircuit/circuit-json-util"
+import type { AnyCircuitElement, PcbBoard } from "circuit-json"
+import {
+  type ConnectivityMap,
+  getFullConnectivityMapFromCircuitJson,
+} from "circuit-json-to-connectivity-map"
+import { getObstaclesFromCircuitJson } from "../obstacles/getObstaclesFromCircuitJson"
+import { getDescendantSubcircuitIds } from "./get-ancestor-subcircuit-ids"
+import { getUnbrokenCopperPourObstacles } from "./getUnbrokenCopperPourObstacles"
+import type { SimpleRouteConnection, SimpleRouteJson } from "./SimpleRouteJson"
+
+/**
+ * This function can only be called in the PcbTraceRender phase or later
+ */
+export const getSimpleRouteJsonFromCircuitJson = ({
+  db,
+  circuitJson,
+  subcircuit_id,
+  minTraceWidth,
+  minTraceToPadEdgeClearance,
+  minViaEdgeToPadEdgeClearance,
+  minViaHoleEdgeToViaHoleEdgeClearance,
+  minPlatedHoleDrillEdgeToDrillEdgeClearance,
+  minPadEdgeToPadEdgeClearance,
+  minBoardEdgeClearance,
+  minViaHoleDiameter,
+  minViaPadDiameter,
+  nominalTraceWidth,
+  subcircuitComponent,
+}: {
+  db?: CircuitJsonUtilObjects
+  circuitJson?: AnyCircuitElement[]
+  subcircuit_id?: string | null
+  minTraceWidth?: number
+  nominalTraceWidth?: number
+  minTraceToPadEdgeClearance?: number
+  minViaEdgeToPadEdgeClearance?: number
+  minViaHoleEdgeToViaHoleEdgeClearance?: number
+  minPlatedHoleDrillEdgeToDrillEdgeClearance?: number
+  minPadEdgeToPadEdgeClearance?: number
+  minBoardEdgeClearance?: number
+  minViaHoleDiameter?: number
+  minViaPadDiameter?: number
+  subcircuitComponent?: {
+    selectAll(selector: string): unknown[]
+  }
+}): { simpleRouteJson: SimpleRouteJson; connMap: ConnectivityMap } => {
+  if (!db && circuitJson) {
+    db = su(circuitJson)
+  }
+
+  if (!db) {
+    throw new Error("db or circuitJson is required")
+  }
+
+  const traceHints = db.pcb_trace_hint.list()
+
+  const relevantSubcircuitIds: Set<string> | null = subcircuit_id
+    ? new Set([subcircuit_id])
+    : null
+  if (subcircuit_id) {
+    const descendantSubcircuitIds = getDescendantSubcircuitIds(
+      db,
+      subcircuit_id,
+    )
+    for (const id of descendantSubcircuitIds) {
+      relevantSubcircuitIds!.add(id)
+    }
+  }
+
+  const subcircuitElements = (circuitJson ?? db.toArray()).filter(
+    (e) =>
+      !subcircuit_id ||
+      ("subcircuit_id" in e && relevantSubcircuitIds!.has(e.subcircuit_id!)),
+  )
+
+  let board: PcbBoard | undefined | null = null
+  if (subcircuit_id) {
+    const source_group_id = subcircuit_id.replace(/^subcircuit_/, "")
+    const source_board = db.source_board.getWhere({ source_group_id })
+    if (source_board) {
+      board = db.pcb_board.getWhere({
+        source_board_id: source_board.source_board_id,
+      })
+    }
+  }
+
+  if (!board) {
+    board = db.pcb_board.list()[0]
+  }
+
+  db = su(subcircuitElements)
+  const pcbGroup = subcircuit_id
+    ? db.pcb_group.getWhere({ subcircuit_id })
+    : undefined
+
+  const connMap = getFullConnectivityMapFromCircuitJson(subcircuitElements)
+
+  const obstacles = getObstaclesFromCircuitJson(
+    [
+      ...db.pcb_component.list(),
+      ...db.pcb_smtpad.list(),
+      ...db.pcb_plated_hole.list(),
+      ...db.pcb_hole.list(),
+      ...db.pcb_via.list(),
+      ...db.pcb_keepout.list(),
+      ...db.pcb_cutout.list(),
+      // getObstaclesFromSoup is old and doesn't support diagonal traces
+      // ...db.pcb_trace.list(),
+    ].filter(
+      (e) => !subcircuit_id || relevantSubcircuitIds?.has(e.subcircuit_id!),
+    ),
+    connMap,
+  )
+  obstacles.push(
+    ...getUnbrokenCopperPourObstacles({
+      connMap,
+      subcircuitComponent,
+      board,
+      group: pcbGroup,
+    }),
+  )
+
+  // Add everything in the connMap to the connectedTo array of each obstacle
+  for (const obstacle of obstacles) {
+    const additionalIds = obstacle.connectedTo.flatMap((id) =>
+      connMap.getIdsConnectedToNet(id),
+    )
+    obstacle.connectedTo.push(...additionalIds)
+  }
+
+  // Build mapping from source_port_id to internal connection ID for interconnects
+  const internalConnections = db.source_component_internal_connection.list()
+  const sourcePortIdToInternalConnectionId = new Map<string, string>()
+  for (const ic of internalConnections) {
+    for (const sourcePortId of ic.source_port_ids) {
+      sourcePortIdToInternalConnectionId.set(
+        sourcePortId,
+        ic.source_component_internal_connection_id,
+      )
+    }
+  }
+
+  // Build mapping from pcb_smtpad_id/pcb_plated_hole_id to source_port_id via pcb_port
+  const pcbElementIdToSourcePortId = new Map<string, string>()
+  for (const pcbPort of db.pcb_port.list()) {
+    if (pcbPort.source_port_id) {
+      // Find the smtpad or plated hole associated with this port
+      const smtpad = db.pcb_smtpad.getWhere({
+        pcb_port_id: pcbPort.pcb_port_id,
+      })
+      if (smtpad) {
+        pcbElementIdToSourcePortId.set(
+          smtpad.pcb_smtpad_id,
+          pcbPort.source_port_id,
+        )
+      }
+      const platedHole = db.pcb_plated_hole.getWhere({
+        pcb_port_id: pcbPort.pcb_port_id,
+      })
+      if (platedHole) {
+        pcbElementIdToSourcePortId.set(
+          platedHole.pcb_plated_hole_id,
+          pcbPort.source_port_id,
+        )
+      }
+    }
+  }
+
+  // Set offBoardConnectsTo and netIsAssignable for obstacles that are part of internal connections
+  for (const obstacle of obstacles) {
+    for (const connectedId of obstacle.connectedTo) {
+      const sourcePortId = pcbElementIdToSourcePortId.get(connectedId)
+      if (sourcePortId) {
+        const internalConnectionId =
+          sourcePortIdToInternalConnectionId.get(sourcePortId)
+        if (internalConnectionId) {
+          obstacle.offBoardConnectsTo = [internalConnectionId]
+          obstacle.netIsAssignable = true
+          break
+        }
+      }
+    }
+  }
+
+  // Calculate bounds
+  const allPoints = obstacles
+    .flatMap((o) => [
+      {
+        x: o.center.x - o.width / 2,
+        y: o.center.y - o.height / 2,
+      },
+      {
+        x: o.center.x + o.width / 2,
+        y: o.center.y + o.height / 2,
+      },
+    ])
+    .concat(board?.outline ?? [])
+
+  let bounds: { minX: number; maxX: number; minY: number; maxY: number }
+
+  if (board && !board.outline) {
+    bounds = {
+      minX: board.center.x - board.width! / 2,
+      maxX: board.center.x + board.width! / 2,
+      minY: board.center.y - board.height! / 2,
+      maxY: board.center.y + board.height! / 2,
+    }
+  } else {
+    bounds = {
+      minX: Math.min(...allPoints.map((p) => p.x)) - 1,
+      maxX: Math.max(...allPoints.map((p) => p.x)) + 1,
+      minY: Math.min(...allPoints.map((p) => p.y)) - 1,
+      maxY: Math.max(...allPoints.map((p) => p.y)) + 1,
+    }
+  }
+
+  if (pcbGroup?.width && pcbGroup.height) {
+    const groupBounds = {
+      minX: pcbGroup.center.x - pcbGroup.width / 2,
+      maxX: pcbGroup.center.x + pcbGroup.width / 2,
+      minY: pcbGroup.center.y - pcbGroup.height / 2,
+      maxY: pcbGroup.center.y + pcbGroup.height / 2,
+    }
+    bounds = {
+      minX: Math.min(bounds.minX, groupBounds.minX),
+      maxX: Math.max(bounds.maxX, groupBounds.maxX),
+      minY: Math.min(bounds.minY, groupBounds.minY),
+      maxY: Math.max(bounds.maxY, groupBounds.maxY),
+    }
+  }
+  const routedTraceIds = new Set(
+    db.pcb_trace
+      .list()
+      .map((t) => t.source_trace_id)
+      .filter((id): id is string => Boolean(id)),
+  )
+
+  // Create connections from traces
+  const directTraceConnections = db.source_trace
+    .list()
+    .filter((trace) => !routedTraceIds.has(trace.source_trace_id))
+    .map((trace) => {
+      const connectedPorts = trace.connected_source_port_ids.map((id) => {
+        const source_port = db.source_port.get(id)
+        const pcb_port = db.pcb_port.getWhere({ source_port_id: id })
+        return {
+          ...source_port,
+          ...pcb_port,
+        }
+      })
+
+      if (connectedPorts.length < 2) return null
+
+      // TODO handle trace.connected_source_net_ids
+      const [portA, portB] = connectedPorts
+      if (!portA || !portB) return null
+
+      if (portA.x === undefined || portA.y === undefined) {
+        console.error(
+          `(source_port_id: ${portA.source_port_id}) for trace ${trace.source_trace_id} does not have x/y coordinates. Skipping this trace.`,
+        )
+        return null
+      }
+      if (portB.x === undefined || portB.y === undefined) {
+        console.error(
+          `(source_port_id: ${portB.source_port_id}) for trace ${trace.source_trace_id} does not have x/y coordinates. Skipping this trace.`,
+        )
+        return null
+      }
+
+      const layerA = portA.layers?.[0] ?? "top"
+      const layerB = portB.layers?.[0] ?? "top"
+
+      // Collect all traceHints that apply to either port
+      const matchingHints = traceHints.filter(
+        (hint) =>
+          hint.pcb_port_id === portA.pcb_port_id ||
+          hint.pcb_port_id === portB.pcb_port_id,
+      )
+
+      const hintPoints: { x: number; y: number; layer: string }[] = []
+
+      for (const hint of matchingHints) {
+        const port = db.pcb_port.get(hint.pcb_port_id)
+        const layer = port?.layers?.[0] ?? "top"
+        for (const pt of hint.route) {
+          hintPoints.push({
+            x: pt.x,
+            y: pt.y,
+            layer,
+          })
+        }
+      }
+
+      return {
+        name:
+          trace.source_trace_id ??
+          connMap.getNetConnectedToId(trace.source_trace_id) ??
+          "",
+        source_trace_id: trace.source_trace_id,
+        nominalTraceWidth: trace.min_trace_thickness,
+        width: trace.min_trace_thickness,
+        pointsToConnect: [
+          {
+            x: portA.x!,
+            y: portA.y!,
+            layer: layerA,
+            pointId: portA.pcb_port_id,
+            pcb_port_id: portA.pcb_port_id,
+          },
+          ...hintPoints,
+          {
+            x: portB.x!,
+            y: portB.y!,
+            layer: layerB,
+            pointId: portB.pcb_port_id,
+            pcb_port_id: portB.pcb_port_id,
+          },
+        ],
+      } as SimpleRouteConnection
+    })
+    .filter((c): c is SimpleRouteConnection => c !== null)
+  const directTraceConnectionsById = new Map(
+    directTraceConnections.map((c) => [c.source_trace_id, c]),
+  )
+
+  const source_nets = db.source_net
+    .list()
+    .filter(
+      (e) => !subcircuit_id || relevantSubcircuitIds?.has(e.subcircuit_id!),
+    )
+
+  const connectionsFromNets: SimpleRouteConnection[] = []
+  for (const net of source_nets) {
+    const connectedSourceTraces = db.source_trace
+      .list()
+      .filter((st) => st.connected_source_net_ids?.includes(net.source_net_id))
+
+    let nominalTraceWidthFromConnectedTraces: number | undefined
+    for (const sourceTrace of connectedSourceTraces) {
+      if (sourceTrace.min_trace_thickness === undefined) continue
+      nominalTraceWidthFromConnectedTraces = Math.max(
+        nominalTraceWidthFromConnectedTraces ?? 0,
+        sourceTrace.min_trace_thickness,
+      )
+    }
+
+    connectionsFromNets.push({
+      name: net.source_net_id ?? connMap.getNetConnectedToId(net.source_net_id),
+      nominalTraceWidth: nominalTraceWidthFromConnectedTraces,
+      width: nominalTraceWidthFromConnectedTraces,
+      pointsToConnect: connectedSourceTraces.flatMap((st) => {
+        const pcb_ports = db.pcb_port
+          .list()
+          .filter((p) =>
+            st.connected_source_port_ids.includes(p.source_port_id),
+          )
+
+        return pcb_ports.map((p) => ({
+          x: p.x!,
+          y: p.y!,
+          layer: (p.layers?.[0] as any) ?? "top",
+          pointId: p.pcb_port_id,
+          pcb_port_id: p.pcb_port_id,
+        }))
+      }),
+    })
+  }
+
+  const breakoutPoints = db.pcb_breakout_point
+    .list()
+    .filter(
+      (bp) => !subcircuit_id || relevantSubcircuitIds?.has(bp.subcircuit_id!),
+    )
+
+  const connectionsFromBreakoutPoints: SimpleRouteConnection[] = []
+  const breakoutTraceConnectionsById = new Map<string, SimpleRouteConnection>()
+
+  for (const bp of breakoutPoints) {
+    const pt = { x: bp.x, y: bp.y, layer: "top" as const }
+    if (bp.source_trace_id) {
+      const conn =
+        directTraceConnectionsById.get(bp.source_trace_id) ??
+        breakoutTraceConnectionsById.get(bp.source_trace_id)
+      if (conn) {
+        conn.pointsToConnect.push(pt)
+      } else {
+        const newConn: SimpleRouteConnection = {
+          name: bp.source_trace_id,
+          source_trace_id: bp.source_trace_id,
+          pointsToConnect: [pt],
+        }
+        connectionsFromBreakoutPoints.push(newConn)
+        breakoutTraceConnectionsById.set(bp.source_trace_id, newConn)
+      }
+    } else if (bp.source_net_id) {
+      const conn = connectionsFromNets.find((c) => c.name === bp.source_net_id)
+      if (conn) {
+        conn.pointsToConnect.push(pt)
+      } else {
+        connectionsFromBreakoutPoints.push({
+          name: bp.source_net_id,
+          pointsToConnect: [pt],
+        })
+      }
+    } else if ((bp as any).source_port_id) {
+      const pcb_port = db.pcb_port.getWhere({
+        source_port_id: (bp as any).source_port_id,
+      })
+      if (pcb_port) {
+        connectionsFromBreakoutPoints.push({
+          name: (bp as any).source_port_id,
+          // direct connection from port to breakout point
+          source_trace_id: undefined as any,
+          pointsToConnect: [
+            {
+              x: pcb_port.x!,
+              y: pcb_port.y!,
+              layer: (pcb_port.layers?.[0] as any) ?? "top",
+              pointId: pcb_port.pcb_port_id,
+              pcb_port_id: pcb_port.pcb_port_id,
+            },
+            pt,
+          ],
+        })
+      }
+    }
+  }
+
+  // ----- 1. Gather all connections we are about to return
+  const allConns: SimpleRouteConnection[] = [
+    ...directTraceConnections,
+    ...connectionsFromNets,
+    ...connectionsFromBreakoutPoints,
+  ]
+
+  // ----- 2. Map every pointId -> its parent connection
+  const pointIdToConn = new Map<string, SimpleRouteConnection>()
+  for (const conn of allConns) {
+    for (const pt of conn.pointsToConnect) {
+      if (pt.pointId) pointIdToConn.set(pt.pointId, conn)
+    }
+  }
+
+  // ----- 3. Walk existing pcb_traces to find already-connected port groups
+  const existingTraces = db.pcb_trace
+    .list()
+    .filter(
+      (t) => !subcircuit_id || relevantSubcircuitIds?.has(t.subcircuit_id!),
+    )
+
+  for (const tr of existingTraces) {
+    const tracePortIds = new Set<string>()
+    for (const seg of tr.route as any[]) {
+      if (seg.start_pcb_port_id) tracePortIds.add(seg.start_pcb_port_id)
+      if (seg.end_pcb_port_id) tracePortIds.add(seg.end_pcb_port_id)
+    }
+    if (tracePortIds.size < 2) continue
+
+    const firstId = tracePortIds.values().next().value
+    if (!firstId) continue
+    const conn = pointIdToConn.get(firstId)
+    if (!conn) continue
+    // ensure every port on the trace belongs to the same connection
+    if (![...tracePortIds].every((pid) => pointIdToConn.get(pid) === conn))
+      continue
+
+    conn.externallyConnectedPointIds ??= []
+    conn.externallyConnectedPointIds.push([...tracePortIds])
+  }
+
+  const resolvedMinViaHoleDiameter =
+    minViaHoleDiameter ?? board?.min_via_hole_diameter
+  const resolvedMinViaPadDiameter =
+    minViaPadDiameter ?? board?.min_via_pad_diameter
+  const resolvedMinTraceToPadEdgeClearance =
+    minTraceToPadEdgeClearance ?? board?.min_trace_to_pad_edge_clearance
+  const resolvedMinViaEdgeToPadEdgeClearance =
+    minViaEdgeToPadEdgeClearance ?? board?.min_via_edge_to_pad_edge_clearance
+  const resolvedMinViaHoleEdgeToViaHoleEdgeClearance =
+    minViaHoleEdgeToViaHoleEdgeClearance ??
+    board?.min_via_hole_edge_to_via_hole_edge_clearance
+  const resolvedMinPlatedHoleDrillEdgeToDrillEdgeClearance =
+    minPlatedHoleDrillEdgeToDrillEdgeClearance ??
+    board?.min_plated_hole_drill_edge_to_drill_edge_clearance
+  const resolvedMinPadEdgeToPadEdgeClearance =
+    minPadEdgeToPadEdgeClearance ?? board?.min_pad_edge_to_pad_edge_clearance
+  const resolvedMinBoardEdgeClearance =
+    minBoardEdgeClearance ?? board?.min_board_edge_clearance
+
+  return {
+    simpleRouteJson: {
+      bounds,
+      obstacles,
+      connections: allConns,
+      // TODO add traces so that we don't run into things routed by another
+      // subcircuit
+      layerCount: board?.num_layers ?? 2,
+      minTraceWidth: minTraceWidth ?? board?.min_trace_width ?? 0.1,
+      minViaDiameter: resolvedMinViaPadDiameter,
+      minViaHoleDiameter: resolvedMinViaHoleDiameter,
+      minViaPadDiameter: resolvedMinViaPadDiameter,
+      min_via_hole_diameter: resolvedMinViaHoleDiameter,
+      min_via_pad_diameter: resolvedMinViaPadDiameter,
+      minTraceToPadEdgeClearance: resolvedMinTraceToPadEdgeClearance,
+      minViaEdgeToPadEdgeClearance: resolvedMinViaEdgeToPadEdgeClearance,
+      minViaHoleEdgeToViaHoleEdgeClearance:
+        resolvedMinViaHoleEdgeToViaHoleEdgeClearance,
+      minPlatedHoleDrillEdgeToDrillEdgeClearance:
+        resolvedMinPlatedHoleDrillEdgeToDrillEdgeClearance,
+      minPadEdgeToPadEdgeClearance: resolvedMinPadEdgeToPadEdgeClearance,
+      minBoardEdgeClearance: resolvedMinBoardEdgeClearance,
+      nominalTraceWidth,
+      outline: board?.outline?.map((point) => ({ ...point })),
+    },
+    connMap,
+  }
+}

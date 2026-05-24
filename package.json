@@ -16,5 +16,11 @@
   },
   "peerDependencies": {
     "typescript": "^5"
+  },
+  "dependencies": {
+    "@tscircuit/capacity-autorouter": "^0.0.542",
+    "@tscircuit/circuit-json-util": "^0.0.94",
+    "circuit-json": "^0.0.426",
+    "circuit-json-to-connectivity-map": "^0.0.23"
   }
 }
